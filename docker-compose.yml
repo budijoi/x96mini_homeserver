@@ -1,0 +1,126 @@
+version: "3.8"
+
+networks:
+  x96mini-net:
+    driver: bridge
+
+volumes:
+  seafile-data:
+  mariadb-data:
+  akkoma-db-data:
+  akkoma-data:
+  motioneye-config:
+  motioneye-recordings:
+
+services:
+  # ======================
+  # 1. CLOUD STORAGE - Seafile
+  # ======================
+  seafile-db:
+    image: mariadb:10.11
+    container_name: seafile-db
+    restart: unless-stopped
+    networks:
+      - x96mini-net
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=${SEAFILE_DB_PW:-changeme_root}
+      - MYSQL_DATABASE=seafile
+      - MYSQL_USER=seafile
+      - MYSQL_PASSWORD=${SEAFILE_DB_PW:-changeme_seafile}
+      - TZ=${TZ:-Asia/Jakarta}
+
+  seafile-memcached:
+    image: memcached:1.6
+    container_name: seafile-memcached
+    restart: unless-stopped
+    networks:
+      - x96mini-net
+    command: ["memcached", "-m", "64"]
+
+  seafile:
+    image: seafileltd/seafile-mc:latest
+    container_name: seafile
+    restart: unless-stopped
+    networks:
+      - x96mini-net
+    ports:
+      - "8001:80"
+      - "8082:8082"
+    volumes:
+      - seafile-data:/shared
+    environment:
+      - DB_HOST=seafile-db
+      - DB_PORT=3306
+      - DB_USER=seafile
+      - DB_PASSWORD=${SEAFILE_DB_PW:-changeme_seafile}
+      - DB_ROOT_PASSWD=${SEAFILE_DB_PW:-changeme_root}
+      - SEAFILE_SERVER_HOSTNAME=${DOMAIN:-localhost}
+      - SEAFILE_ADMIN_EMAIL=${SEAFILE_ADMIN_EMAIL:-admin@example.com}
+      - SEAFILE_ADMIN_PASSWORD=${SEAFILE_ADMIN_PW:-changeme_admin}
+      - MEMCACHED_HOST=seafile-memcached
+      - MEMCACHED_PORT=11211
+      - TZ=${TZ:-Asia/Jakarta}
+    depends_on:
+      - seafile-db
+      - seafile-memcached
+
+  # ======================
+  # 2. MICROBLOG - Akkoma
+  # ======================
+  akkoma-db:
+    image: postgres:15-alpine
+    container_name: akkoma-db
+    restart: unless-stopped
+    networks:
+      - x96mini-net
+    volumes:
+      - akkoma-db-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=akkoma
+      - POSTGRES_USER=akkoma
+      - POSTGRES_PASSWORD=${AKKOMA_DB_PW:-changeme_akkoma}
+      - TZ=${TZ:-Asia/Jakarta}
+
+  akkoma:
+    image: akkoma/akkoma:stable
+    container_name: akkoma
+    restart: unless-stopped
+    networks:
+      - x96mini-net
+    ports:
+      - "4000:4000"
+    volumes:
+      - akkoma-data:/var/lib/akkoma
+    environment:
+      - DB_HOST=akkoma-db
+      - DB_PORT=5432
+      - DB_NAME=akkoma
+      - DB_USER=akkoma
+      - DB_PASS=${AKKOMA_DB_PW:-changeme_akkoma}
+      - DOMAIN=${DOMAIN:-localhost}
+      - TZ=${TZ:-Asia/Jakarta}
+    depends_on:
+      - akkoma-db
+
+  # ======================
+  # 3. CCTV DVR - MotionEye
+  # ======================
+  motioneye:
+    image: ccrisan/motioneye:latest
+    container_name: motioneye
+    restart: unless-stopped
+    networks:
+      - x96mini-net
+    ports:
+      - "8765:8765"
+      - "8081:8081"
+    volumes:
+      - motioneye-config:/etc/motioneye
+      - motioneye-recordings:/var/lib/motioneye
+    devices:
+      - /dev/video0:/dev/video0
+    privileged: true
+    environment:
+      - TZ=${TZ:-Asia/Jakarta}
