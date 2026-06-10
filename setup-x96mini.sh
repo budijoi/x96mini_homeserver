@@ -228,7 +228,7 @@ deploy_services() {
 
     local compose_dir="${MOUNT_DIR}/compose"
     local data_dir="${MOUNT_DIR}/data"
-    mkdir -p "$compose_dir" "$data_dir"/{seafile,akkoma-db,akkoma,motioneye,mariadb,dashboard}
+    mkdir -p "$compose_dir" "$data_dir"/{seafile,akkoma-db,akkoma,mariadb,dashboard}
 
     # Generate random passwords
     SEAFILE_DB_PW=$(openssl rand -base64 16)
@@ -237,8 +237,6 @@ deploy_services() {
 
     # Tulis docker-compose.yml
     cat > "${compose_dir}/docker-compose.yml" <<COMPOSE
-version: "3.8"
-
 networks:
   x96mini-net:
     driver: bridge
@@ -268,12 +266,6 @@ volumes:
       type: none
       o: bind
       device: ${data_dir}/akkoma
-  motioneye-config:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ${data_dir}/motioneye
 
 services:
   # ======================
@@ -368,28 +360,7 @@ services:
       - akkoma-db
 
   # ======================
-  # 3. CCTV DVR - MotionEye
-  # ======================
-  motioneye:
-    image: ccrisan/motioneye:latest
-    container_name: motioneye
-    restart: unless-stopped
-    networks:
-      - x96mini-net
-    ports:
-      - "8765:8765"
-      - "8081:8081"
-    volumes:
-      - motioneye-config:/etc/motioneye
-      - "${data_dir}/motioneye/recordings:/var/lib/motioneye"
-    devices:
-      - /dev/video0:/dev/video0
-    privileged: true
-    environment:
-      - TZ=${TZ}
-
-  # ======================
-  # 4. DASHBOARD (port 80)
+  # 3. DASHBOARD (port 80)
   # ======================
   dashboard:
     image: python:3.11-alpine
@@ -399,6 +370,8 @@ services:
       - x96mini-net
     ports:
       - "80:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - "${data_dir}/dashboard:/app"
     working_dir: /app
@@ -416,9 +389,9 @@ from pathlib import Path
 PORT = 80
 HTML_FILE = Path(__file__).parent / "index.html"
 SERVICES = {
-    "Seafile":   {"host": "seafile",   "port": 80,   "url": "http://localhost:8001"},
-    "Akkoma":    {"host": "akkoma",    "port": 4000, "url": "http://localhost:4000"},
-    "MotionEye": {"host": "motioneye", "port": 8765, "url": "http://localhost:8765"},
+    "Seafile":   {"host": "seafile",              "port": 80,   "url": "http://localhost:8001"},
+    "Akkoma":    {"host": "akkoma",               "port": 4000, "url": "http://localhost:4000"},
+    "Motion":    {"host": "host.docker.internal",  "port": 8765, "url": "http://localhost:8765"},
 }
 
 def read_proc(path):
@@ -553,7 +526,7 @@ footer{text-align:center;color:var(--muted);font-size:.75rem;margin-top:32px}
 <div class="grid grid-3" style="margin-bottom:24px">
 <a href="http://localhost:8001" target="_blank" class="service-card" id="card-seafile"><div class="icon">&#x1F4C1;</div><div class="name">Seafile</div><div class="desc">Cloud Storage pribadi</div><div class="badge" id="status-seafile">memeriksa...</div></a>
 <a href="http://localhost:4000" target="_blank" class="service-card" id="card-akkoma"><div class="icon">&#x2709;&#xFE0F;</div><div class="name">Akkoma</div><div class="desc">MicroBlog terfederasi</div><div class="badge" id="status-akkoma">memeriksa...</div></a>
-<a href="http://localhost:8765" target="_blank" class="service-card" id="card-motioneye"><div class="icon">&#x1F4F7;</div><div class="name">MotionEye</div><div class="desc">CCTV DVR / IP Camera</div><div class="badge" id="status-motioneye">memeriksa...</div></a>
+<a href="http://localhost:8765" target="_blank" class="service-card" id="card-motioneye"><div class="icon">&#x1F4F7;</div><div class="name">Motion</div><div class="desc">CCTV DVR / IP Camera</div><div class="badge" id="status-motioneye">memeriksa...</div></a>
 </div>
 <footer>X96Mini Server &mdash; Armbian aarch64</footer>
 </div>
@@ -610,6 +583,72 @@ CRED
     ok "Semua service telah dideploy!"
     echo ""
     cat "${compose_dir}/.credentials"
+}
+
+# ---- Setup CCTV (Native motion + motioneye) ----
+setup_cctv() {
+    if command -v motion &>/dev/null && systemctl is-active --quiet motion 2>/dev/null; then
+        ok "CCTV (motion) sudah terinstall"
+        return
+    fi
+
+    info "Memasang CCTV DVR (motion + motioneye)..."
+    apt-get install -y -qq motion python3-pip python3-dev python3-setuptools
+
+    # Buat direktori rekaman
+    local record_dir="${MOUNT_DIR}/data/motioneye/recordings"
+    mkdir -p "$record_dir"
+
+    # Konfigurasi motion
+    cat > /etc/motion/motion.conf <<MOTION
+daemon on
+log_level 3
+log_file /var/log/motion.log
+target_dir ${record_dir}
+videodevice /dev/video0
+width 640
+height 480
+framerate 5
+threshold 1500
+event_gap 60
+pre_capture 3
+post_capture 10
+stream_port 8765
+stream_localhost off
+stream_maxrate 10
+webcontrol_port 8080
+webcontrol_localhost off
+webcontrol_parms 0
+picture_output off
+movie_output on
+movie_codec mpeg4
+movie_max_time 60
+MOTION
+
+    # Install motioneye via pip
+    pip3 install motioneye --break-system-packages 2>/dev/null || pip3 install motioneye 2>/dev/null || true
+
+    # Systemd service untuk motion
+    cat > /etc/systemd/system/motion.service <<UNIT
+[Unit]
+Description=Motion CCTV daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/motion -c /etc/motion/motion.conf
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable motion
+    systemctl restart motion
+
+    ok "CCTV DVR terinstall (port 8765 - stream, port 8080 - webcontrol)"
 }
 
 # ---- Info tambahan ----
@@ -726,6 +765,7 @@ main() {
     tune_system
     install_docker
     setup_docker_data
+    setup_cctv
     deploy_services
     show_info
 
@@ -741,6 +781,7 @@ case "${1:-}" in
     --swap-only) setup_swap ;;
     --storage-only) setup_storage ;;
     --deploy-only) deploy_services ;;
+    --cctv-only) setup_cctv ;;
     --help|-h)
         echo "Penggunaan: bash $0 [OPTION]"
         echo "  (tanpa option)  Setup lengkap"
@@ -749,6 +790,7 @@ case "${1:-}" in
         echo "  --swap-only     Setup SWAP saja"
         echo "  --storage-only  Setup MicroSD storage saja"
         echo "  --deploy-only   Deploy Docker services saja"
+        echo "  --cctv-only     Install CCTV DVR (motion native)"
         ;;
     *) main ;;
 esac
