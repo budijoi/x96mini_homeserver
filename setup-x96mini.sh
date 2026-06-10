@@ -228,12 +228,11 @@ deploy_services() {
 
     local compose_dir="${MOUNT_DIR}/compose"
     local data_dir="${MOUNT_DIR}/data"
-    mkdir -p "$compose_dir" "$data_dir"/{seafile,akkoma-db,akkoma,mariadb,dashboard}
+    mkdir -p "$compose_dir" "$data_dir"/{seafile,mariadb,dashboard}
 
     # Generate random passwords
     SEAFILE_DB_PW=$(openssl rand -base64 16)
     SEAFILE_ADMIN_PW=$(openssl rand -base64 12)
-    AKKOMA_DB_PW=$(openssl rand -base64 16)
 
     # Tulis docker-compose.yml
     cat > "${compose_dir}/docker-compose.yml" <<COMPOSE
@@ -254,18 +253,6 @@ volumes:
       type: none
       o: bind
       device: ${data_dir}/mariadb
-  akkoma-db-data:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ${data_dir}/akkoma-db
-  akkoma-config:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ${data_dir}/akkoma
 
 services:
   # ======================
@@ -322,45 +309,7 @@ services:
       - seafile-memcached
 
   # ======================
-  # 2. MICROBLOG - Akkoma
-  # ======================
-  akkoma-db:
-    image: postgres:15-alpine
-    container_name: akkoma-db
-    restart: unless-stopped
-    networks:
-      - x96mini-net
-    volumes:
-      - akkoma-db-data:/var/lib/postgresql/data
-    environment:
-      - POSTGRES_DB=akkoma
-      - POSTGRES_USER=akkoma
-      - POSTGRES_PASSWORD=${AKKOMA_DB_PW}
-      - TZ=${TZ}
-
-  akkoma:
-    image: akkoma/akkoma:stable
-    container_name: akkoma
-    restart: unless-stopped
-    networks:
-      - x96mini-net
-    ports:
-      - "4000:4000"
-    volumes:
-      - akkoma-config:/var/lib/akkoma
-    environment:
-      - DB_HOST=akkoma-db
-      - DB_PORT=5432
-      - DB_NAME=akkoma
-      - DB_USER=akkoma
-      - DB_PASS=${AKKOMA_DB_PW}
-      - DOMAIN=${DOMAIN}
-      - TZ=${TZ}
-    depends_on:
-      - akkoma-db
-
-  # ======================
-  # 3. DASHBOARD (port 80)
+  # 2. DASHBOARD (port 80)
   # ======================
   dashboard:
     image: python:3.11-alpine
@@ -389,9 +338,9 @@ from pathlib import Path
 PORT = 80
 HTML_FILE = Path(__file__).parent / "index.html"
 SERVICES = {
-    "Seafile":   {"host": "seafile",              "port": 80,   "url": "http://localhost:8001"},
-    "Akkoma":    {"host": "akkoma",               "port": 4000, "url": "http://localhost:4000"},
-    "Motion":    {"host": "host.docker.internal",  "port": 8765, "url": "http://localhost:8765"},
+    "Seafile":     {"host": "seafile",              "port": 80,   "url": "http://localhost:8001"},
+    "WriteFreely": {"host": "host.docker.internal",  "port": 4000, "url": "http://localhost:4000"},
+    "Motion":      {"host": "host.docker.internal",  "port": 8765, "url": "http://localhost:8765"},
 }
 
 def read_proc(path):
@@ -525,7 +474,7 @@ footer{text-align:center;color:var(--muted);font-size:.75rem;margin-top:32px}
 <h2 style="font-size:1rem;margin-bottom:12px;color:var(--muted)">Navigasi</h2>
 <div class="grid grid-3" style="margin-bottom:24px">
 <a href="http://localhost:8001" target="_blank" class="service-card" id="card-seafile"><div class="icon">&#x1F4C1;</div><div class="name">Seafile</div><div class="desc">Cloud Storage pribadi</div><div class="badge" id="status-seafile">memeriksa...</div></a>
-<a href="http://localhost:4000" target="_blank" class="service-card" id="card-akkoma"><div class="icon">&#x2709;&#xFE0F;</div><div class="name">Akkoma</div><div class="desc">MicroBlog terfederasi</div><div class="badge" id="status-akkoma">memeriksa...</div></a>
+<a href="http://localhost:4000" target="_blank" class="service-card" id="card-writefreely"><div class="icon">&#x2709;&#xFE0F;</div><div class="name">WriteFreely</div><div class="desc">MicroBlog / Blog pribadi</div><div class="badge" id="status-writefreely">memeriksa...</div></a>
 <a href="http://localhost:8765" target="_blank" class="service-card" id="card-motioneye"><div class="icon">&#x1F4F7;</div><div class="name">Motion</div><div class="desc">CCTV DVR / IP Camera</div><div class="badge" id="status-motioneye">memeriksa...</div></a>
 </div>
 <footer>X96Mini Server &mdash; Armbian aarch64</footer>
@@ -555,21 +504,18 @@ SEAFILE:
   Admin  : admin@example.com
   Pass   : ${SEAFILE_ADMIN_PW}
 
-AKKOMA:
+WRITEFREELY:
   URL    : http://${DOMAIN}:4000
-  Setup  : akses URL untuk registrasi pertama
+  Setup  : akses URL untuk registrasi admin pertama
 
-MOTIONEYE:
+CCTV (Motion):
   URL    : http://${DOMAIN}:8765
-  User   : admin
-  Pass   : (kosong, set via UI setelah login)
+  Config : /etc/motion/motion.conf
+  Record : ${MOUNT_DIR}/data/motioneye/recordings
 
-DATABASE CREDENTIALS (seafile):
+SEAFILE DATABASE:
   Root   : root / ${SEAFILE_DB_PW}
   User   : seafile / ${SEAFILE_DB_PW}
-
-DATABASE CREDENTIALS (akkoma):
-  User   : akkoma / ${AKKOMA_DB_PW}
 
 ========================================
 CRED
@@ -651,6 +597,69 @@ UNIT
     ok "CCTV DVR terinstall (port 8765 - stream, port 8080 - webcontrol)"
 }
 
+# ---- Setup MicroBlog (WriteFreely native) ----
+setup_microblog() {
+    if [[ -f /usr/local/bin/writefreely ]]; then
+        ok "WriteFreely sudah terinstall"
+        return
+    fi
+
+    info "Memasang MicroBlog (WriteFreely)..."
+    apt-get install -y -qq sqlite3 curl
+
+    local wf_dir="${MOUNT_DIR}/data/writefreely"
+    mkdir -p "$wf_dir"
+
+    # Download binary arm64
+    local wf_ver="0.16.0"
+    local wf_url="https://github.com/writefreely/writefreely/releases/download/v${wf_ver}/writefreely_${wf_ver}_linux_arm64.tar.gz"
+
+    curl -fsSL "$wf_url" -o /tmp/writefreely.tar.gz
+    tar xzf /tmp/writefreely.tar.gz -C /tmp/
+    cp /tmp/writefreely/writefreely /usr/local/bin/writefreely
+    chmod +x /usr/local/bin/writefreely
+    rm -rf /tmp/writefreely /tmp/writefreely.tar.gz
+
+    # Inisialisasi konfigurasi
+    cd "$wf_dir"
+    /usr/local/bin/writefreely config start --port 4000 --bind 0.0.0.0
+
+    # Edit config.ini untuk bind address
+    local config="$wf_dir/config.ini"
+    if [[ -f "$config" ]]; then
+        sed -i "s/^bind\s*=.*/bind = 0.0.0.0/" "$config"
+        sed -i "s/^port\s*=.*/port = 4000/" "$config"
+    fi
+
+    # Inisialisasi database
+    /usr/local/bin/writefreely db init 2>/dev/null || true
+    /usr/local/bin/writefreely db migrate 2>/dev/null || true
+
+    # Systemd service
+    cat > /etc/systemd/system/writefreely.service <<UNIT
+[Unit]
+Description=WriteFreely MicroBlog
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/writefreely --config ${config}
+WorkingDirectory=${wf_dir}
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable writefreely
+    systemctl restart writefreely
+
+    ok "MicroBlog (WriteFreely) terinstall di port 4000"
+}
+
 # ---- Info tambahan ----
 show_info() {
     echo ""
@@ -665,9 +674,10 @@ show_info() {
     echo ""
     echo -e "Service URLs:"
     echo -e "  Dashboard     : ${CYAN}http://${DOMAIN}${NC} (Homepage)"
-    echo -e "  Cloud Storage : ${CYAN}http://${DOMAIN}:8001${NC}"
-    echo -e "  MicroBlog     : ${CYAN}http://${DOMAIN}:4000${NC}"
-    echo -e "  CCTV DVR      : ${CYAN}http://${DOMAIN}:8765${NC}"
+    echo -e "  Cloud Storage : ${CYAN}http://${DOMAIN}:8001${NC} (Seafile)"
+    echo -e "  MicroBlog     : ${CYAN}http://${DOMAIN}:4000${NC} (WriteFreely)"
+    echo -e "  CCTV DVR      : ${CYAN}http://${DOMAIN}:8765${NC} (Motion stream)"
+    echo -e "  Motion Config  : ${CYAN}http://${DOMAIN}:8080${NC} (webcontrol)"
     echo ""
     echo -e "Credential disimpan di: ${YELLOW}${MOUNT_DIR}/compose/.credentials${NC}"
     echo ""
@@ -766,6 +776,7 @@ main() {
     install_docker
     setup_docker_data
     setup_cctv
+    setup_microblog
     deploy_services
     show_info
 
@@ -782,6 +793,7 @@ case "${1:-}" in
     --storage-only) setup_storage ;;
     --deploy-only) deploy_services ;;
     --cctv-only) setup_cctv ;;
+    --microblog-only) setup_microblog ;;
     --help|-h)
         echo "Penggunaan: bash $0 [OPTION]"
         echo "  (tanpa option)  Setup lengkap"
@@ -791,6 +803,7 @@ case "${1:-}" in
         echo "  --storage-only  Setup MicroSD storage saja"
         echo "  --deploy-only   Deploy Docker services saja"
         echo "  --cctv-only     Install CCTV DVR (motion native)"
+        echo "  --microblog-only Install WriteFreely (microblog)"
         ;;
     *) main ;;
 esac
