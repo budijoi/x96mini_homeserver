@@ -163,31 +163,41 @@ install_docker() {
     fi
 
     info "Memasang Docker untuk aarch64..."
-
-    # Uninstall paket lama
-    apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
-
-    # Install dependensi
     apt-get update -qq
-    apt-get install -y -qq ca-certificates curl gnupg lsb-release
 
-    # Repo Docker
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null || {
-        warn "Gagal download key Docker, coba metode alternatif..."
-        apt-get install -y -qq docker.io docker-compose-v2
-        systemctl enable --now docker
-        ok "Docker terinstall (via distro repo)"
-        return
-    }
+    # Hapus repo Docker lama yang mungkin salah dari percobaan sebelumnya
+    rm -f /etc/apt/sources.list.d/docker.list 2>/dev/null || true
 
-    echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+    # Deteksi apakah ini Armbian dengan codename Ubuntu
+    local codename
+    codename=$(grep -oP '^VERSION_CODENAME=\K.*' /etc/os-release 2>/dev/null | tr -d '"' || echo "")
 
-    apt-get update -qq
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    # Daftar codename Ubuntu yang dikenal
+    local is_ubuntu_codename=0
+    for c in focal jammy kinetic lunar mantic noble oracular plucky; do
+        [[ "$codename" == "$c" ]] && { is_ubuntu_codename=1; break; }
+    done
 
+    if [[ "$is_ubuntu_codename" -eq 1 ]]; then
+        # Armbian dengan codename Ubuntu → forced pakai repo Ubuntu
+        info "Mendeteksi sistem dengan codename Ubuntu (${codename}). Pakai repo Docker Ubuntu..."
+        apt-get install -y -qq ca-certificates curl gnupg
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null
+        echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename} stable" > /etc/apt/sources.list.d/docker.list
+        apt-get update -qq 2>/dev/null && \
+        apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin 2>/dev/null && {
+            systemctl enable --now docker
+            ok "Docker + Docker Compose terinstall (via repo Ubuntu)"
+            return
+        }
+        warn "Repo Docker Ubuntu gagal, fallback ke distro..."
+    fi
+
+    # Fallback: install dari repo distro
+    apt-get install -y -qq docker.io docker-compose-v2
     systemctl enable --now docker
-    ok "Docker + Docker Compose terinstall"
+    ok "Docker terinstall (via distro repo)"
 }
 
 # ---- Setup Docker Data di MicroSD ----
@@ -218,7 +228,7 @@ deploy_services() {
 
     local compose_dir="${MOUNT_DIR}/compose"
     local data_dir="${MOUNT_DIR}/data"
-    mkdir -p "$compose_dir" "$data_dir"/{seafile,akkoma-db,akkoma,motioneye,mariadb}
+    mkdir -p "$compose_dir" "$data_dir"/{seafile,akkoma-db,akkoma,motioneye,mariadb,dashboard}
 
     # Generate random passwords
     SEAFILE_DB_PW=$(openssl rand -base64 16)
@@ -377,14 +387,195 @@ services:
     privileged: true
     environment:
       - TZ=${TZ}
+
+  # ======================
+  # 4. DASHBOARD (port 80)
+  # ======================
+  dashboard:
+    image: python:3.11-alpine
+    container_name: dashboard
+    restart: unless-stopped
+    networks:
+      - x96mini-net
+    ports:
+      - "80:80"
+    volumes:
+      - "${data_dir}/dashboard:/app"
+    working_dir: /app
+    command: python server.py
+    environment:
+      - TZ=${TZ}
 COMPOSE
 
-    # Simpan kredensial
+    # Tulis dashboard files
+    cat > "${data_dir}/dashboard/server.py" <<'PYEOF'
+#!/usr/bin/env python3
+import http.server, json, os, socket, time
+from pathlib import Path
+
+PORT = 80
+HTML_FILE = Path(__file__).parent / "index.html"
+SERVICES = {
+    "Seafile":   {"host": "seafile",   "port": 80,   "url": "http://localhost:8001"},
+    "Akkoma":    {"host": "akkoma",    "port": 4000, "url": "http://localhost:4000"},
+    "MotionEye": {"host": "motioneye", "port": 8765, "url": "http://localhost:8765"},
+}
+
+def read_proc(path):
+    try:
+        with open(path) as f: return f.read()
+    except OSError: return ""
+
+def get_uptime():
+    raw = read_proc("/proc/uptime").strip()
+    if not raw: return {"days":0,"hours":0,"minutes":0}
+    s = float(raw.split()[0])
+    return {"days":int(s//86400),"hours":int((s%86400)//3600),"minutes":int((s%3600)//60)}
+
+def get_loadavg():
+    raw = read_proc("/proc/loadavg").strip()
+    if not raw: return [0,0,0]
+    return [float(x) for x in raw.split()[:3]]
+
+def get_memory():
+    raw = read_proc("/proc/meminfo"); mem = {}
+    for line in raw.splitlines():
+        p = line.split()
+        if len(p)>=2: mem[p[0].rstrip(":")] = int(p[1])
+    t = mem.get("MemTotal",0); a = mem.get("MemAvailable",0); u = t - a
+    return {"total_kb":t,"used_kb":u,"available_kb":a,"percent":round(u/t*100,1) if t else 0}
+
+def get_swap():
+    raw = read_proc("/proc/meminfo"); mem = {}
+    for line in raw.splitlines():
+        p = line.split()
+        if len(p)>=2: mem[p[0].rstrip(":")] = int(p[1])
+    t = mem.get("SwapTotal",0); f = mem.get("SwapFree",0); u = t - f
+    return {"total_kb":t,"used_kb":u,"free_kb":f,"percent":round(u/t*100,1) if t else 0}
+
+def get_disk(path="/srv/x96mini"):
+    try:
+        st = os.statvfs(path)
+        t = st.f_frsize * st.f_blocks; f = st.f_frsize * st.f_bfree; u = t - f
+        return {"total_gb":round(t/(1024**3),1),"used_gb":round(u/(1024**3),1),"free_gb":round(f/(1024**3),1),"percent":round(u/t*100,1) if t else 0}
+    except: return {"total_gb":0,"used_gb":0,"free_gb":0,"percent":0}
+
+def check_service(host,port,timeout=2):
+    try:
+        sock = socket.create_connection((host,port),timeout=timeout); sock.close()
+        return "online"
+    except: return "offline"
+
+def get_services_status():
+    r = {}
+    for n,i in SERVICES.items(): r[n] = {"status": check_service(i["host"],i["port"]), "url": i["url"]}
+    return r
+
+def get_status():
+    return {"system":{"hostname":os.uname().nodename,"uptime":get_uptime(),"loadavg":get_loadavg(),"memory":get_memory(),"swap":get_swap(),"disk":get_disk()},"services":get_services_status()}
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/api/status":
+            self.send_response(200)
+            self.send_header("Content-Type","application/json"); self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers(); self.wfile.write(json.dumps(get_status()).encode())
+        elif self.path in ("/","/index.html"):
+            self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.end_headers()
+            if HTML_FILE.exists(): self.wfile.write(HTML_FILE.read_bytes())
+            else: self.wfile.write(b"<h1>Dashboard</h1><p>index.html not found</p>")
+        else:
+            self.send_response(404); self.end_headers(); self.wfile.write(b"Not found")
+    def log_message(self,fmt,*args): pass
+
+if __name__ == "__main__":
+    http.server.HTTPServer(("0.0.0.0",PORT),H).serve_forever()
+PYEOF
+
+    cat > "${data_dir}/dashboard/index.html" <<'HTMLEOF'
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>X96Mini Dashboard</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0f1117;--card:#1a1d27;--border:#2a2d3a;--text:#e1e4eb;--muted:#7a7f8e;--accent:#6366f1;--green:#22c55e;--red:#ef4444;--yellow:#eab308;--radius:12px}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:24px}
+.container{max-width:900px;width:100%}
+header{text-align:center;margin-bottom:32px}
+header h1{font-size:1.6rem;font-weight:700}
+header h1 span{color:var(--accent)}
+header p{color:var(--muted);font-size:.85rem;margin-top:4px}
+#uptime{color:var(--muted);font-size:.8rem;margin-top:8px}
+.grid{display:grid;gap:16px;margin-bottom:24px}
+.grid-3{grid-template-columns:repeat(3,1fr)}
+.grid-2{grid-template-columns:repeat(2,1fr)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;transition:transform .15s,border-color .15s}
+.card:hover{border-color:var(--accent)}
+.card-title{font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}
+.card-value{font-size:1.4rem;font-weight:700}
+.card-sub{font-size:.75rem;color:var(--muted);margin-top:4px}
+.bar-wrap{margin-top:10px}
+.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
+.bar-fill{height:100%;border-radius:3px;transition:width .5s}
+.bar-label{display:flex;justify-content:space-between;font-size:.7rem;color:var(--muted);margin-top:4px}
+.service-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:24px;text-decoration:none;color:var(--text);display:block;transition:transform .15s,border-color .15s,box-shadow .15s;position:relative;overflow:hidden}
+.service-card:hover{border-color:var(--accent);transform:translateY(-2px);box-shadow:0 8px 24px rgba(99,102,241,.15)}
+.service-card .icon{font-size:2rem;margin-bottom:8px}
+.service-card .name{font-size:1.1rem;font-weight:600}
+.service-card .desc{font-size:.78rem;color:var(--muted)}
+.service-card .badge{display:inline-block;font-size:.65rem;padding:2px 10px;border-radius:99px;margin-top:8px;font-weight:600}
+.badge.online{background:rgba(34,197,94,.15);color:var(--green)}
+.badge.offline{background:rgba(239,68,68,.15);color:var(--red)}
+footer{text-align:center;color:var(--muted);font-size:.75rem;margin-top:32px}
+@media(max-width:640px){.grid-3{grid-template-columns:1fr 1fr}.grid-2{grid-template-columns:1fr}body{padding:16px}}
+</style>
+</head>
+<body>
+<div class="container">
+<header>
+<h1>X96Mini <span>Dashboard</span></h1>
+<p id="hostname"></p>
+<div id="uptime"></div>
+</header>
+<div class="grid grid-3">
+<div class="card"><div class="card-title">CPU Load</div><div class="card-value" id="load">-</div><div class="card-sub">1 min / 5 min / 15 min</div></div>
+<div class="card"><div class="card-title">RAM</div><div class="card-value" id="ram">-</div><div class="bar-wrap"><div class="bar"><div class="bar-fill" id="ram-bar" style="width:0%;background:var(--accent)"></div></div><div class="bar-label"><span id="ram-used">-</span><span id="ram-total">-</span></div></div></div>
+<div class="card"><div class="card-title">SWAP</div><div class="card-value" id="swap">-</div><div class="bar-wrap"><div class="bar"><div class="bar-fill" id="swap-bar" style="width:0%;background:var(--yellow)"></div></div><div class="bar-label"><span id="swap-used">-</span><span id="swap-total">-</span></div></div></div>
+</div>
+<div class="grid grid-2" style="margin-bottom:24px">
+<div class="card"><div class="card-title">Storage (MicroSD 64GB)</div><div class="card-value" id="disk-used">-</div><div class="card-sub" id="disk-detail"></div><div class="bar-wrap"><div class="bar"><div class="bar-fill" id="disk-bar" style="width:0%;background:var(--green)"></div></div><div class="bar-label"><span id="disk-used-label">-</span><span id="disk-total-label">-</span></div></div></div>
+<div class="card"><div class="card-title">Services Status</div><div id="service-status-list" style="font-size:.85rem"></div></div>
+</div>
+<h2 style="font-size:1rem;margin-bottom:12px;color:var(--muted)">Navigasi</h2>
+<div class="grid grid-3" style="margin-bottom:24px">
+<a href="http://localhost:8001" target="_blank" class="service-card" id="card-seafile"><div class="icon">&#x1F4C1;</div><div class="name">Seafile</div><div class="desc">Cloud Storage pribadi</div><div class="badge" id="status-seafile">memeriksa...</div></a>
+<a href="http://localhost:4000" target="_blank" class="service-card" id="card-akkoma"><div class="icon">&#x2709;&#xFE0F;</div><div class="name">Akkoma</div><div class="desc">MicroBlog terfederasi</div><div class="badge" id="status-akkoma">memeriksa...</div></a>
+<a href="http://localhost:8765" target="_blank" class="service-card" id="card-motioneye"><div class="icon">&#x1F4F7;</div><div class="name">MotionEye</div><div class="desc">CCTV DVR / IP Camera</div><div class="badge" id="status-motioneye">memeriksa...</div></a>
+</div>
+<footer>X96Mini Server &mdash; Armbian aarch64</footer>
+</div>
+<script>
+async function fetchStatus(){try{const r=await fetch('/api/status');const d=await r.json();render(d)}catch(e){document.getElementById('load').textContent='offline'}}
+function render(d){const s=d.system;document.getElementById('hostname').textContent='Host: '+s.hostname;const u=s.uptime,p=[];if(u.days)p.push(u.days+'d');if(u.hours)p.push(u.hours+'j');p.push(u.minutes+'m');document.getElementById('uptime').textContent='Uptime: '+p.join(' ');const l=s.loadavg;document.getElementById('load').textContent=l.map(v=>v.toFixed(2)).join(' / ');const m=s.memory;const g=v=>(v/(1024*1024)).toFixed(1);document.getElementById('ram').textContent=m.percent+'%';document.getElementById('ram-bar').style.width=m.percent+'%';document.getElementById('ram-used').textContent=g(m.used_kb)+' GB used';document.getElementById('ram-total').textContent=g(m.total_kb)+' GB';const w=s.swap;document.getElementById('swap').textContent=w.total_kb?w.percent+'%':'none';document.getElementById('swap-bar').style.width=(w.total_kb?w.percent:0)+'%';document.getElementById('swap-used').textContent=w.total_kb?g(w.used_kb)+' GB used':'-';document.getElementById('swap-total').textContent=w.total_kb?g(w.total_kb)+' GB':'-';const k=s.disk;document.getElementById('disk-used').textContent=k.used_gb+' GB / '+k.total_gb+' GB';document.getElementById('disk-detail').textContent=k.percent+'% terpakai';document.getElementById('disk-bar').style.width=k.percent+'%';document.getElementById('disk-used-label').textContent=k.used_gb+' GB used';document.getElementById('disk-total-label').textContent=k.total_gb+' GB';const t=document.getElementById('service-status-list');t.innerHTML='';for(const[n,i]of Object.entries(d.services)){const r=document.createElement('div');r.style.display='flex';r.style.justifyContent='space-between';r.style.padding='4px 0';const o=i.status==='online'?'&#x1F7E2;':'&#x1F534;';r.innerHTML=o+' '+n+'<span style="color:'+(i.status==='online'?'var(--green)':'var(--red)')+'">'+i.status+'</span>';t.appendChild(r)}for(const[n,i]of Object.entries(d.services)){const b=document.getElementById('status-'+n.toLowerCase());if(b){b.textContent=i.status;b.className='badge '+i.status}}}
+fetchStatus();setInterval(fetchStatus,10000);
+</script>
+</body>
+</html>
+HTMLEOF
+
+    ok "Dashboard files created"
     cat > "${compose_dir}/.credentials" <<CRED
 ========================================
 X96Mini SERVICE CREDENTIALS
 ========================================
 Simpan file ini dengan aman!
+
+DASHBOARD:
+  URL    : http://${DOMAIN}
+  Status : Live system status + navigasi
 
 SEAFILE:
   URL    : http://${DOMAIN}:8001
@@ -434,6 +625,7 @@ show_info() {
     echo -e "Domain   : ${DOMAIN}"
     echo ""
     echo -e "Service URLs:"
+    echo -e "  Dashboard     : ${CYAN}http://${DOMAIN}${NC} (Homepage)"
     echo -e "  Cloud Storage : ${CYAN}http://${DOMAIN}:8001${NC}"
     echo -e "  MicroBlog     : ${CYAN}http://${DOMAIN}:4000${NC}"
     echo -e "  CCTV DVR      : ${CYAN}http://${DOMAIN}:8765${NC}"
