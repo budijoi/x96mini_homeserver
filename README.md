@@ -13,6 +13,19 @@ Jalankan installer
 ```bash
 sudo ./setup-x96mini.sh
 ```
+File	Fungsi
+* setup-x96mini.sh	Script utama (otomatis: ZRAM, SWAP, MicroSD, Docker, deploy semua service)
+* docker-compose.yml	Standalone compose file (untuk manual deploy)
+* .env.example	Template konfigurasi environment
+
+Yang dilakukan script:
+
+* ZRAM - 1024MB (50% RAM) pakai algoritma zstd
+* SWAP - 2048MB file di MicroSD
+* MicroSD - Format ext4, mount ke /srv/x96mini
+* System tuning - swappiness=60, dirty_ratio=20, dll
+* Docker - Install + alihkan data-root ke MicroSD
+* Deploy services via Docker Compose:
 
 Untuk akses dari luar + reverse proxy (setelah setup domain):
 ```bash
