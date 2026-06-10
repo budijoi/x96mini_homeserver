@@ -16,7 +16,7 @@ err()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 SD_DEV="${SD_DEV:-/dev/mmcblk1}"       # MicroSD device
 SD_PART="${SD_PART:-${SD_DEV}p1}"       # MicroSD partition (may be /dev/mmcblk1p1)
 MOUNT_DIR="${MOUNT_DIR:-/srv/x96mini}"  # Mount point untuk MicroSD
-ZRAM_SIZE="${ZRAM_SIZE:-1024}"          # MB (50% dari 2GB RAM)
+ZRAM_SIZE="${ZRAM_SIZE:-512}"           # MB (25% dari 2GB RAM)
 SWAP_FILE="${SWAP_FILE:-${MOUNT_DIR}/swapfile}"
 SWAP_SIZE="${SWAP_SIZE:-2048}"          # MB (2GB swap)
 DOMAIN="${DOMAIN:-$(hostname -I | awk '{print $1}')}"
@@ -95,6 +95,22 @@ setup_storage() {
         mkdir -p "$MOUNT_DIR"
         return
     fi
+
+    # Cek apakah ada partisi; jika tidak, buat partisi baru
+    HAS_PART=$(lsblk -n "$SD_DEV" | grep -c part || true)
+    if [[ "$HAS_PART" -eq 0 ]]; then
+        warn "MicroSD belum memiliki partisi. Membuat partisi baru..."
+        apt-get install -y -qq parted &>/dev/null || true
+        parted -s "$SD_DEV" mklabel msdos
+        parted -s "$SD_DEV" mkpart primary ext4 0% 100%
+        sleep 2
+        partprobe "$SD_DEV" 2>/dev/null || blockdev --rereadpt "$SD_DEV" 2>/dev/null || true
+        sleep 2
+    fi
+
+    # Deteksi partisi (nama partisi bervariasi: mmcblk1p1, mmcblk1_1, dll)
+    SD_PART=$(lsblk -nlo NAME "$SD_DEV" | grep -v "^$(basename "$SD_DEV")$" | head -1)
+    SD_PART="/dev/${SD_PART}"
 
     # Format jika belum ext4
     FSTYPE=$(blkid -s TYPE -o value "$SD_PART" 2>/dev/null || echo "")
