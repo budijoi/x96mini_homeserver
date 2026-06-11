@@ -228,16 +228,24 @@ deploy_services() {
 
     local compose_dir="${MOUNT_DIR}/compose"
     local data_dir="${MOUNT_DIR}/data"
+    local cred_file="${compose_dir}/.credentials"
     mkdir -p "$compose_dir" "$data_dir"/{seafile,mariadb,dashboard}
 
-    # Generate random passwords
-    SEAFILE_DB_PW=$(openssl rand -base64 16)
-    SEAFILE_ADMIN_PW=$(openssl rand -base64 12)
+    # Generate atau baca ulang password (agar persist antar deploy)
+    if [[ -f "$cred_file" ]]; then
+        SEAFILE_DB_PW=$(grep 'seafile-root' "$cred_file" 2>/dev/null | awk '{print $NF}') || true
+        SEAFILE_ADMIN_PW=$(grep 'seafile-admin' "$cred_file" 2>/dev/null | awk '{print $NF}') || true
+    fi
+    SEAFILE_DB_PW="${SEAFILE_DB_PW:-$(openssl rand -base64 16)}"
+    SEAFILE_ADMIN_PW="${SEAFILE_ADMIN_PW:-$(openssl rand -base64 12)}"
 
     # Tulis docker-compose.yml
     cat > "${compose_dir}/docker-compose.yml" <<COMPOSE
+name: x96mini
+
 networks:
   x96mini-net:
+    name: x96mini-net
     driver: bridge
 
 volumes:
@@ -272,6 +280,12 @@ services:
       - MYSQL_USER=seafile
       - MYSQL_PASSWORD=${SEAFILE_DB_PW}
       - TZ=${TZ}
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   seafile-memcached:
     image: memcached:1.6
@@ -305,8 +319,10 @@ services:
       - MEMCACHED_PORT=11211
       - TZ=${TZ}
     depends_on:
-      - seafile-db
-      - seafile-memcached
+      seafile-db:
+        condition: service_healthy
+      seafile-memcached:
+        condition: service_started
 
   # ======================
   # 2. DASHBOARD (port 80)
@@ -482,7 +498,7 @@ footer{text-align:center;color:var(--muted);font-size:.75rem;margin-top:32px}
 <script>
 async function fetchStatus(){try{const r=await fetch('/api/status');const d=await r.json();render(d)}catch(e){document.getElementById('load').textContent='offline'}}
 function render(d){const s=d.system;document.getElementById('hostname').textContent='Host: '+s.hostname;const u=s.uptime,p=[];if(u.days)p.push(u.days+'d');if(u.hours)p.push(u.hours+'j');p.push(u.minutes+'m');document.getElementById('uptime').textContent='Uptime: '+p.join(' ');const l=s.loadavg;document.getElementById('load').textContent=l.map(v=>v.toFixed(2)).join(' / ');const m=s.memory;const g=v=>(v/(1024*1024)).toFixed(1);document.getElementById('ram').textContent=m.percent+'%';document.getElementById('ram-bar').style.width=m.percent+'%';document.getElementById('ram-used').textContent=g(m.used_kb)+' GB used';document.getElementById('ram-total').textContent=g(m.total_kb)+' GB';const w=s.swap;document.getElementById('swap').textContent=w.total_kb?w.percent+'%':'none';document.getElementById('swap-bar').style.width=(w.total_kb?w.percent:0)+'%';document.getElementById('swap-used').textContent=w.total_kb?g(w.used_kb)+' GB used':'-';document.getElementById('swap-total').textContent=w.total_kb?g(w.total_kb)+' GB':'-';const k=s.disk;document.getElementById('disk-used').textContent=k.used_gb+' GB / '+k.total_gb+' GB';document.getElementById('disk-detail').textContent=k.percent+'% terpakai';document.getElementById('disk-bar').style.width=k.percent+'%';document.getElementById('disk-used-label').textContent=k.used_gb+' GB used';document.getElementById('disk-total-label').textContent=k.total_gb+' GB';const t=document.getElementById('service-status-list');t.innerHTML='';for(const[n,i]of Object.entries(d.services)){const r=document.createElement('div');r.style.display='flex';r.style.justifyContent='space-between';r.style.padding='4px 0';const o=i.status==='online'?'&#x1F7E2;':'&#x1F534;';r.innerHTML=o+' '+n+'<span style="color:'+(i.status==='online'?'var(--green)':'var(--red)')+'">'+i.status+'</span>';t.appendChild(r)}for(const[n,i]of Object.entries(d.services)){const b=document.getElementById('status-'+n.toLowerCase());if(b){b.textContent=i.status;b.className='badge '+i.status}}}
-fetchStatus();setInterval(fetchStatus,10000);
+fetchStatus();setInterval(fetchStatus,3000);
 </script>
 </body>
 </html>
@@ -495,9 +511,11 @@ X96Mini SERVICE CREDENTIALS
 ========================================
 Simpan file ini dengan aman!
 
+seafile-root ${SEAFILE_DB_PW}
+seafile-admin ${SEAFILE_ADMIN_PW}
+
 DASHBOARD:
   URL    : http://${DOMAIN}
-  Status : Live system status + navigasi
 
 SEAFILE:
   URL    : http://${DOMAIN}:8001
@@ -506,23 +524,21 @@ SEAFILE:
 
 WRITEFREELY:
   URL    : http://${DOMAIN}:4000
-  Setup  : akses URL untuk registrasi admin pertama
+  Config : ${MOUNT_DIR}/data/writefreely/config.ini
 
 CCTV (Motion):
   URL    : http://${DOMAIN}:8765
   Config : /etc/motion/motion.conf
   Record : ${MOUNT_DIR}/data/motioneye/recordings
 
-SEAFILE DATABASE:
-  Root   : root / ${SEAFILE_DB_PW}
-  User   : seafile / ${SEAFILE_DB_PW}
-
 ========================================
 CRED
     chmod 600 "${compose_dir}/.credentials"
 
-    # Deploy
+    # Deploy (cleanup dulu biar ga bentrok network)
     cd "$compose_dir"
+    docker compose down --remove-orphans 2>/dev/null || true
+    sleep 2
     docker compose pull
     docker compose up -d
 
@@ -618,22 +634,41 @@ setup_microblog() {
     tar xzf /tmp/writefreely.tar.gz -C /tmp/
     cp /tmp/writefreely/writefreely /usr/local/bin/writefreely
     chmod +x /usr/local/bin/writefreely
+    # Copy direktori pendukung
+    cp -r /tmp/writefreely/keys /tmp/writefreely/pages /tmp/writefreely/static /tmp/writefreely/templates "$wf_dir/" 2>/dev/null || true
     rm -rf /tmp/writefreely /tmp/writefreely.tar.gz
 
-    # Inisialisasi konfigurasi
-    cd "$wf_dir"
-    /usr/local/bin/writefreely config start --port 4000 --bind 0.0.0.0
+    # Generate secret
+    local wf_secret
+    wf_secret=$(openssl rand -base64 32)
 
-    # Edit config.ini untuk bind address
-    local config="$wf_dir/config.ini"
-    if [[ -f "$config" ]]; then
-        sed -i "s/^bind\s*=.*/bind = 0.0.0.0/" "$config"
-        sed -i "s/^port\s*=.*/port = 4000/" "$config"
+    # Buat config.ini
+    cat > "$wf_dir/config.ini" <<WFCFG
+[server]
+bind        = 0.0.0.0
+port        = 4000
+
+[database]
+type        = sqlite3
+filename    = writefreely.db
+
+[app]
+secret      = ${wf_secret}
+host        = http://${DOMAIN}:4000
+single_user = true
+open_registration = true
+WFCFG
+
+    # Generate encryption keys jika belum ada
+    if [[ ! -f "$wf_dir/keys/encrypt_key" ]]; then
+        mkdir -p "$wf_dir/keys"
+        /usr/local/bin/writefreely keys generate 2>&1 | tail -3 || true
     fi
 
     # Inisialisasi database
-    /usr/local/bin/writefreely db init 2>/dev/null || true
-    /usr/local/bin/writefreely db migrate 2>/dev/null || true
+    cd "$wf_dir"
+    /usr/local/bin/writefreely db init 2>&1 | tail -3 || true
+    /usr/local/bin/writefreely db migrate 2>&1 | tail -3 || true
 
     # Systemd service
     cat > /etc/systemd/system/writefreely.service <<UNIT
@@ -643,7 +678,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/writefreely --config ${config}
+ExecStart=/usr/local/bin/writefreely --config ${wf_dir}/config.ini
 WorkingDirectory=${wf_dir}
 Restart=always
 RestartSec=5
